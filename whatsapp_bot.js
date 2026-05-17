@@ -23,7 +23,7 @@
 const express    = require('express');
 const twilio     = require('twilio');
 const axios      = require('axios');
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -80,7 +80,7 @@ async function sendMessage(to, body) {
 // ──────────────────────────────────────────────
 let aiClient = null;
 if (GEMINI_API_KEY) {
-    aiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+    aiClient = new GoogleGenerativeAI(GEMINI_API_KEY);
     console.log('✅ Gemini AI client initialized.');
 }
 
@@ -678,21 +678,24 @@ async function handleAI(chatId, text, state) {
         const systemPrompt = botSettings.system_prompt || DEFAULT_SYSTEM_PROMPT;
 
         const history = state.chatHistory || [];
-        history.push({ role: 'user', parts: [{ text }] });
 
-        const chat = aiClient.chats.create({
-            model: 'gemini-2.5-flash',
-            config: {
-                systemInstruction: systemPrompt,
-                temperature:       0.35,
-                maxOutputTokens:   512,
+        const model = aiClient.getGenerativeModel({
+            model: 'gemini-1.5-flash',
+            systemInstruction: systemPrompt,
+            generationConfig: {
+                temperature:     0.35,
+                maxOutputTokens: 512,
             },
-            history: history.slice(0, -1),
         });
 
-        const response = await chat.sendMessage({ message: text });
-        const reply    = response.text?.trim() || 'দুঃখিত, কোনো উত্তর পাওয়া যায়নি।';
+        const chat = model.startChat({
+            history: history.map(h => ({ role: h.role, parts: h.parts })),
+        });
 
+        const result = await chat.sendMessage(text);
+        const reply  = result.response.text().trim() || 'দুঃখিত, কোনো উত্তর পাওয়া যায়নি।';
+
+        history.push({ role: 'user',  parts: [{ text }] });
         history.push({ role: 'model', parts: [{ text: reply }] });
         state.chatHistory = history.length > MAX_HISTORY_TURNS * 2
             ? history.slice(-(MAX_HISTORY_TURNS * 2))
