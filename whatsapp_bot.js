@@ -1,41 +1,79 @@
 /**
  * ╔══════════════════════════════════════════════════════╗
- * ║   সবুজ কম্পিউটার্স — WhatsApp Bot (Pro Edition)    ║
- * ║   Telegram Bot থেকে রূপান্তরিত                      ║
+ * ║   সবুজ কম্পিউটার্স — WhatsApp Bot (Twilio Edition) ║
+ * ║   whatsapp-web.js থেকে Twilio API-তে রূপান্তরিত    ║
  * ╚══════════════════════════════════════════════════════╝
  *
  * Features:
- *  - Inline menu (buttons) via whatsapp-web.js
+ *  - Twilio WhatsApp API (webhook-based, no Chrome/Puppeteer)
  *  - Gemini AI chat (multi-turn history)
  *  - Firebase Realtime DB (due/attendance/receipt/account linking)
  *  - Admin commands: broadcast, add_notice, delete_notice, verify_student, stats
  *  - Rate limiting
- *  - Admin reply forwarding (reply to forwarded messages)
+ *  - Admin reply forwarding
  *
  * Setup:
- *  1. npm install whatsapp-web.js @google/genai axios qrcode-terminal
+ *  1. npm install
  *  2. Set environment variables (see below)
- *  3. node whatsapp_bot.js  → scan QR code with your WhatsApp
+ *  3. node whatsapp_bot.js
+ *  4. Railway URL → Twilio Webhook এ সেট করুন:
+ *     https://your-app.railway.app/webhook  (POST)
  */
 
-const { Client, LocalAuth, Buttons, List, MessageMedia } = require('whatsapp-web.js');
-const qrcode   = require('qrcode-terminal');
-const axios    = require('axios');
+const express    = require('express');
+const twilio     = require('twilio');
+const axios      = require('axios');
 const { GoogleGenAI } = require('@google/genai');
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 // ──────────────────────────────────────────────
 // ⚙️ Environment & Constants
 // ──────────────────────────────────────────────
-const GEMINI_API_KEY  = process.env.GEMINI_API_KEY  || '';
-const ADMIN_PHONE     = process.env.ADMIN_PHONE     || ''; // e.g. "8801724084350@c.us"
-const FIREBASE_URL    = process.env.FIREBASE_URL    || 'https://sabuj-computers-default-rtdb.asia-southeast1.firebasedatabase.app';
-const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
+const TWILIO_ACCOUNT_SID   = process.env.TWILIO_ACCOUNT_SID   || '';
+const TWILIO_AUTH_TOKEN    = process.env.TWILIO_AUTH_TOKEN    || '';
+const TWILIO_WA_NUMBER     = process.env.TWILIO_WA_NUMBER     || ''; // e.g. "whatsapp:+14155238886"
+const GEMINI_API_KEY       = process.env.GEMINI_API_KEY       || '';
+const ADMIN_PHONE          = process.env.ADMIN_PHONE          || ''; // e.g. "whatsapp:+8801724084350"
+const FIREBASE_URL         = process.env.FIREBASE_URL         || 'https://sabuj-computers-default-rtdb.asia-southeast1.firebasedatabase.app';
+const FIREBASE_SECRET      = process.env.FIREBASE_SECRET      || '';
+const PORT                 = process.env.PORT                 || 3000;
 
 // Rate limiting config
 const RATE_LIMIT_CALLS  = 5;   // max messages
 const RATE_LIMIT_PERIOD = 30;  // per N seconds
 
 const MAX_HISTORY_TURNS = 6;
+
+// ──────────────────────────────────────────────
+// 📤 Twilio Client
+// ──────────────────────────────────────────────
+let twilioClient = null;
+if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+    twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    console.log('✅ Twilio client initialized.');
+} else {
+    console.warn('⚠️ Twilio credentials missing! Set TWILIO_ACCOUNT_SID & TWILIO_AUTH_TOKEN.');
+}
+
+// Twilio দিয়ে message পাঠানোর helper
+async function sendMessage(to, body) {
+    if (!twilioClient) {
+        console.error('Twilio client not initialized.');
+        return;
+    }
+    try {
+        await twilioClient.messages.create({
+            from: TWILIO_WA_NUMBER,
+            to:   to,
+            body: body,
+        });
+    } catch (e) {
+        console.error(`Twilio send error [${to}]:`, e.message);
+    }
+}
 
 // ──────────────────────────────────────────────
 // 🤖 Gemini AI Setup
@@ -46,7 +84,7 @@ if (GEMINI_API_KEY) {
     console.log('✅ Gemini AI client initialized.');
 }
 
-const DEFAULT_SYSTEM_PROMPT = `You are a helpful AI assistant for 'Sabuj Computers Training Center' (সবুজ কম্পিউটার ট্রেনিং সেন্টার), located at Tamaltala Bazar, Bagatipara, Natore, Bangladesh. Always respond in polite, friendly Bengali. Always greet with 'আসসালামু আলাইকুম' — never use 'নমস্কার'. Office hours: Sat–Thu 9:00 AM–1:30 PM & 4:00 PM–8:30 PM (Friday closed). Courses: (1) Foundation Course — 6 months, ৳3500. (2) BTEB Course — 6 months, ৳4500 (Govt approved). Phone: 01724-084350. Email: sssabuj007@gmail.com. Website: https://sabujcomputers.pro.bd. Keep answers concise and helpful. If the user asks about their fee, attendance, or receipt, tell them to use !due, !attendance, or !receipt after linking their account via the 'অ্যাকাউন্ট লিঙ্ক করুন' option. Do not make up information. If you don't know something, say so politely.`;
+const DEFAULT_SYSTEM_PROMPT = `You are a helpful AI assistant for 'Sabuj Computers Training Center' (সবুজ কম্পিউটার ট্রেনিং সেন্টার), located at Tamaltala Bazar, Bagatipara, Natore, Bangladesh. Always respond in polite, friendly Bengali. Always greet with 'আসসালামু আলাইকুম' — never use 'নমস্কার'. Office hours: Sat–Thu 9:00 AM–1:30 PM & 4:00 PM–8:30 PM (Friday closed). Courses: (1) Foundation Course — 6 months, ৳3500. (2) BTEB Course — 6 months, ৳4500 (Govt approved). Phone: 01724-084350. Email: sssabuj007@gmail.com. Website: https://sabujcomputers.pro.bd. Keep answers concise and helpful. If the user asks about their fee, attendance, or receipt, tell them to use !due, !attendance, or !receipt after linking their account via !link. Do not make up information. If you don't know something, say so politely.`;
 
 // ──────────────────────────────────────────────
 // 🗄️ Firebase Helpers
@@ -57,8 +95,7 @@ function authParam() {
 
 async function getDb(path) {
     try {
-        const url = `${FIREBASE_URL}/${path}.json${authParam()}`;
-        const res = await axios.get(url, { timeout: 8000 });
+        const res = await axios.get(`${FIREBASE_URL}/${path}.json${authParam()}`, { timeout: 8000 });
         return res.data;
     } catch (e) {
         console.error(`GET error [${path}]:`, e.message);
@@ -68,8 +105,7 @@ async function getDb(path) {
 
 async function putDb(path, data) {
     try {
-        const url = `${FIREBASE_URL}/${path}.json${authParam()}`;
-        const res = await axios.put(url, data, { timeout: 8000 });
+        const res = await axios.put(`${FIREBASE_URL}/${path}.json${authParam()}`, data, { timeout: 8000 });
         return res.data;
     } catch (e) {
         console.error(`PUT error [${path}]:`, e.message);
@@ -79,8 +115,7 @@ async function putDb(path, data) {
 
 async function patchDb(path, data) {
     try {
-        const url = `${FIREBASE_URL}/${path}.json${authParam()}`;
-        const res = await axios.patch(url, data, { timeout: 8000 });
+        const res = await axios.patch(`${FIREBASE_URL}/${path}.json${authParam()}`, data, { timeout: 8000 });
         return res.data;
     } catch (e) {
         console.error(`PATCH error [${path}]:`, e.message);
@@ -90,8 +125,7 @@ async function patchDb(path, data) {
 
 async function deleteDb(path) {
     try {
-        const url = `${FIREBASE_URL}/${path}.json${authParam()}`;
-        const res = await axios.delete(url, { timeout: 8000 });
+        const res = await axios.delete(`${FIREBASE_URL}/${path}.json${authParam()}`, { timeout: 8000 });
         return res.status === 200;
     } catch (e) {
         console.error(`DELETE error [${path}]:`, e.message);
@@ -101,9 +135,9 @@ async function deleteDb(path) {
 
 function nowStr() {
     return new Date().toLocaleString('en-BD', {
-        timeZone: 'Asia/Dhaka',
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', hour12: true
+        timeZone:  'Asia/Dhaka',
+        year:      'numeric', month:  '2-digit', day:    '2-digit',
+        hour:      '2-digit', minute: '2-digit', hour12: true,
     });
 }
 
@@ -118,6 +152,7 @@ const rateLimitStore = new Map(); // chatId -> [timestamps]
 
 function isAdmin(chatId) {
     if (!ADMIN_PHONE) return false;
+    // chatId format: "whatsapp:+8801724084350"
     return chatId === ADMIN_PHONE;
 }
 
@@ -131,9 +166,9 @@ function isRateLimited(chatId) {
 }
 
 // ──────────────────────────────────────────────
-// 💬 User State Storage (in-memory, per session)
+// 💬 User State Storage (in-memory)
 // ──────────────────────────────────────────────
-const userState    = new Map(); // chatId -> { awaiting, chatHistory, pendingReplyTo }
+const userState = new Map(); // chatId -> { awaiting, chatHistory }
 
 function getState(chatId) {
     if (!userState.has(chatId)) userState.set(chatId, { awaiting: '', chatHistory: [] });
@@ -141,7 +176,7 @@ function getState(chatId) {
 }
 
 // ──────────────────────────────────────────────
-// 📋 Menu Text (WhatsApp uses text-based menus)
+// 📋 Menu Texts
 // ──────────────────────────────────────────────
 function mainMenuText() {
     return (
@@ -167,226 +202,6 @@ function mainMenuText() {
         `🌐 ওয়েবসাইট: https://sabujcomputers.pro.bd\n` +
         `📞 ফোন: 01724-084350`
     );
-}
-
-// ──────────────────────────────────────────────
-// 🚀 WhatsApp Client Setup
-// ──────────────────────────────────────────────
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    }
-});
-
-client.on('qr', qr => {
-    console.log('\n📱 QR কোড স্ক্যান করুন WhatsApp দিয়ে:\n');
-    qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    console.log('✅ WhatsApp Bot চালু হয়েছে! (সবুজ কম্পিউটার্স)');
-});
-
-client.on('auth_failure', () => {
-    console.error('❌ Authentication failed! session মুছে আবার চেষ্টা করুন।');
-});
-
-// ──────────────────────────────────────────────
-// 📨 Main Message Handler
-// ──────────────────────────────────────────────
-client.on('message', async (msg) => {
-    // Ignore group messages (optional — remove this to support groups)
-    if (msg.from.endsWith('@g.us')) return;
-
-    const chatId = msg.from;
-    const text   = (msg.body || '').trim();
-    const state  = getState(chatId);
-
-    // Skip status messages
-    if (chatId === 'status@broadcast') return;
-
-    // ── Rate limit (skip for admin) ──
-    if (!isAdmin(chatId) && isRateLimited(chatId)) {
-        await msg.reply('⏳ একটু থামুন! অনেক দ্রুত মেসেজ পাঠাচ্ছেন। কিছুক্ষণ পর আবার চেষ্টা করুন।');
-        return;
-    }
-
-    // ── Admin reply forwarding ──
-    // Admin replies to a forwarded message that contains [CHATID:xxxxxxxx]
-    if (isAdmin(chatId) && msg.hasQuotedMsg) {
-        const quoted = await msg.getQuotedMessage();
-        const match  = (quoted.body || '').match(/\[CHATID:(\d+@c\.us)\]/);
-        if (match) {
-            const targetId = match[1];
-            try {
-                await client.sendMessage(targetId, `🎧 *অ্যাডমিনের রিপ্লাই:*\n\n${text}`);
-                await msg.reply('✅ রিপ্লাই সফলভাবে পাঠানো হয়েছে।');
-            } catch (e) {
-                await msg.reply(`❌ রিপ্লাই পাঠানো যায়নি: ${e.message}`);
-            }
-            return;
-        }
-    }
-
-    // ── State: Account Linking ──
-    if (state.awaiting === 'link_reg') {
-        await handleLinkAccount(msg, chatId, text, state);
-        return;
-    }
-
-    // ── State: Talk to Admin ──
-    if (state.awaiting === 'talk_admin') {
-        await handleTalkAdmin(msg, chatId, text, state);
-        return;
-    }
-
-    // ── Commands ──
-    const cmd = text.toLowerCase().split(' ')[0];
-
-    switch (cmd) {
-        case '!start':
-        case '!menu':
-        case '!help':
-            await msg.reply(cmd === '!help' ? helpText() : mainMenuText());
-            break;
-
-        case '!courses':
-            await handleCourses(msg);
-            break;
-
-        case '!fees':
-            await msg.reply(feesText());
-            break;
-
-        case '!admission':
-            await msg.reply(admissionText());
-            break;
-
-        case '!results':
-            await msg.reply(
-                `🏆 *ফলাফল ও সার্টিফিকেট যাচাই*\n\n` +
-                `━━━━━━━━━━━━━━━━━━\n` +
-                `আপনার রেজিস্ট্রেশন নম্বর দিয়ে অনলাইনে যাচাই করুন:\n\n` +
-                `🔗 https://sabujcomputers.pro.bd/verify.html`
-            );
-            break;
-
-        case '!notice':
-            await handleNotice(msg);
-            break;
-
-        case '!contact':
-            await msg.reply(contactText());
-            break;
-
-        case '!link':
-            state.awaiting = 'link_reg';
-            await msg.reply(
-                `🔗 *অ্যাকাউন্ট লিঙ্ক করুন*\n\n` +
-                `আপনার *ফোন নম্বর* অথবা *রেজিস্ট্রেশন নম্বর* টাইপ করে সেন্ড করুন:\n\n` +
-                `_(উদাহরণ: 01724084350 বা SC-2024-001)_`
-            );
-            break;
-
-        case '!due':
-            await handleDue(msg, chatId);
-            break;
-
-        case '!attendance':
-            await handleAttendance(msg, chatId);
-            break;
-
-        case '!receipt':
-            await handleReceipt(msg, chatId);
-            break;
-
-        case '!unlink':
-            await handleUnlink(msg, chatId);
-            break;
-
-        case '!admin':
-            state.awaiting = 'talk_admin';
-            await msg.reply(
-                `🎧 *সরাসরি অ্যাডমিনের সাথে কথা বলুন*\n\n` +
-                `আপনার প্রশ্ন বা মেসেজটি এখন টাইপ করে সেন্ড করুন।\n` +
-                `অ্যাডমিন কিছুক্ষণের মধ্যে রিপ্লাই দেবেন। ⏳`
-            );
-            break;
-
-        // ── Admin Commands ──
-        case '!broadcast':
-            await handleBroadcast(msg, chatId, text);
-            break;
-
-        case '!add_notice':
-            await handleAddNotice(msg, chatId, text);
-            break;
-
-        case '!delete_notice':
-            await handleDeleteNotice(msg, chatId, text);
-            break;
-
-        case '!verify_student':
-            await handleVerifyStudent(msg, chatId, text);
-            break;
-
-        case '!stats':
-            await handleStats(msg, chatId);
-            break;
-
-        default:
-            // ── Gemini AI (free text) ──
-            if (!text.startsWith('!') && aiClient) {
-                await handleAI(msg, chatId, text, state);
-            } else if (text.startsWith('!')) {
-                await msg.reply(
-                    `❓ কমান্ড বোঝা যায়নি। *!help* টাইপ করুন সব কমান্ড দেখতে।`
-                );
-            } else {
-                await msg.reply(
-                    `আমি বুঝতে পারিনি। *!menu* টাইপ করুন মেনু দেখতে।`
-                );
-            }
-    }
-});
-
-// ──────────────────────────────────────────────
-// 📦 Feature Handlers
-// ──────────────────────────────────────────────
-
-async function handleCourses(msg) {
-    const courses = await getDb('sabuj/courses');
-    let text = `🎓 *আমাদের কোর্সসমূহ*\n\n━━━━━━━━━━━━━━━━━━\n`;
-
-    if (courses && typeof courses === 'object') {
-        let i = 1;
-        for (const [, c] of Object.entries(courses)) {
-            text += (
-                `${i}️⃣ *${c.name || 'কোর্স'}*\n` +
-                `   ✅ মেয়াদ: ${c.duration || 'N/A'}\n` +
-                `   ✅ ফি: ৳${c.fee || 'N/A'}\n` +
-                `   ✅ সার্টিফিকেট: ${c.cert || 'N/A'}\n\n`
-            );
-            i++;
-        }
-    } else {
-        text += (
-            `1️⃣ *ফাউন্ডেশন কোর্স*\n` +
-            `   ✅ মেয়াদ: ৬ মাস\n` +
-            `   ✅ ফি: ৳৩,৫০০\n` +
-            `   ✅ বিষয়: Basic Computer, MS Office, Internet\n` +
-            `   ✅ সার্টিফিকেট: নিজস্ব\n\n` +
-            `2️⃣ *BTEB কোর্স*\n` +
-            `   ✅ মেয়াদ: ৬ মাস\n` +
-            `   ✅ ফি: ৳৪,৫০০\n` +
-            `   ✅ সার্টিফিকেট: সরকারি (BTEB অনুমোদিত)\n` +
-            `   ✅ চাকরির বাজারে ১০০% গ্রহণযোগ্য\n\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `📞 ভর্তির জন্য: 01724-084350`
-        );
-    }
-    await msg.reply(text);
 }
 
 function feesText() {
@@ -462,7 +277,45 @@ function helpText() {
     );
 }
 
-async function handleNotice(msg) {
+// ──────────────────────────────────────────────
+// 📦 Feature Handlers
+// ──────────────────────────────────────────────
+
+async function handleCourses(chatId) {
+    const courses = await getDb('sabuj/courses');
+    let text = `🎓 *আমাদের কোর্সসমূহ*\n\n━━━━━━━━━━━━━━━━━━\n`;
+
+    if (courses && typeof courses === 'object') {
+        let i = 1;
+        for (const [, c] of Object.entries(courses)) {
+            text += (
+                `${i}️⃣ *${c.name || 'কোর্স'}*\n` +
+                `   ✅ মেয়াদ: ${c.duration || 'N/A'}\n` +
+                `   ✅ ফি: ৳${c.fee || 'N/A'}\n` +
+                `   ✅ সার্টিফিকেট: ${c.cert || 'N/A'}\n\n`
+            );
+            i++;
+        }
+    } else {
+        text += (
+            `1️⃣ *ফাউন্ডেশন কোর্স*\n` +
+            `   ✅ মেয়াদ: ৬ মাস\n` +
+            `   ✅ ফি: ৳৩,৫০০\n` +
+            `   ✅ বিষয়: Basic Computer, MS Office, Internet\n` +
+            `   ✅ সার্টিফিকেট: নিজস্ব\n\n` +
+            `2️⃣ *BTEB কোর্স*\n` +
+            `   ✅ মেয়াদ: ৬ মাস\n` +
+            `   ✅ ফি: ৳৪,৫০০\n` +
+            `   ✅ সার্টিফিকেট: সরকারি (BTEB অনুমোদিত)\n` +
+            `   ✅ চাকরির বাজারে ১০০% গ্রহণযোগ্য\n\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `📞 ভর্তির জন্য: 01724-084350`
+        );
+    }
+    await sendMessage(chatId, text);
+}
+
+async function handleNotice(chatId) {
     const notices = await getDb('sabuj/notices');
     let text = `📢 *নোটিশ বোর্ড*\n\n━━━━━━━━━━━━━━━━━━\n`;
 
@@ -477,10 +330,10 @@ async function handleNotice(msg) {
     } else {
         text += `বর্তমানে কোনো নোটিশ নেই।\n`;
     }
-    await msg.reply(text);
+    await sendMessage(chatId, text);
 }
 
-async function handleLinkAccount(msg, chatId, text, state) {
+async function handleLinkAccount(chatId, text, state) {
     const apps = (await getDb('sabuj/applications')) || {};
     let foundKey = null;
 
@@ -494,14 +347,15 @@ async function handleLinkAccount(msg, chatId, text, state) {
     }
 
     if (foundKey) {
-        await patchDb(`sabuj/telegram_users/${chatId}`, {
-            appId:        foundKey,
-            linkedAt:     new Date().toISOString(),
-            platform:     'whatsapp',
-            whatsappName: (await msg.getContact()).pushname || '',
+        // chatId format: "whatsapp:+8801XXXXXXXXX"
+        await patchDb(`sabuj/telegram_users/${encodeKey(chatId)}`, {
+            appId:    foundKey,
+            linkedAt: new Date().toISOString(),
+            platform: 'whatsapp_twilio',
+            phone:    chatId,
         });
         state.awaiting = '';
-        await msg.reply(
+        await sendMessage(chatId,
             `✅ *অ্যাকাউন্ট সফলভাবে লিঙ্ক হয়েছে!* 🎉\n\n` +
             `এখন আপনি নিচের কমান্ডগুলো ব্যবহার করতে পারবেন:\n\n` +
             `🔹 !due — বকেয়া ফি জানতে\n` +
@@ -510,7 +364,7 @@ async function handleLinkAccount(msg, chatId, text, state) {
             `🔹 !unlink — অ্যাকাউন্ট আনলিঙ্ক`
         );
     } else {
-        await msg.reply(
+        await sendMessage(chatId,
             `❌ তথ্য পাওয়া যায়নি।\n\n` +
             `সঠিক *ফোন নম্বর* বা *রেজিস্ট্রেশন নম্বর* দিয়ে আবার চেষ্টা করুন।\n` +
             `সমস্যা হলে সরাসরি যোগাযোগ করুন: 📞 01724-084350`
@@ -518,46 +372,46 @@ async function handleLinkAccount(msg, chatId, text, state) {
     }
 }
 
-async function handleTalkAdmin(msg, chatId, text, state) {
+async function handleTalkAdmin(chatId, text, senderName, state) {
     state.awaiting = '';
     if (!ADMIN_PHONE) {
-        await msg.reply('⚠️ অ্যাডমিন কনফিগার করা নেই। সরাসরি যোগাযোগ করুন: 📞 01724-084350');
+        await sendMessage(chatId, '⚠️ অ্যাডমিন কনফিগার করা নেই। সরাসরি যোগাযোগ করুন: 📞 01724-084350');
         return;
     }
-    const contact = await msg.getContact();
+    const phone = chatId.replace('whatsapp:', '');
     try {
-        await client.sendMessage(
-            ADMIN_PHONE,
+        await sendMessage(ADMIN_PHONE,
             `📨 *নতুন সাপোর্ট মেসেজ (WhatsApp)*\n\n` +
-            `👤 নাম: ${contact.pushname || 'অজানা'}\n` +
-            `📱 নম্বর: ${chatId.replace('@c.us', '')}\n` +
-            `[CHATID:${chatId}]\n\n` +
+            `👤 নাম: ${senderName || 'অজানা'}\n` +
+            `📱 নম্বর: ${phone}\n` +
+            `[REPLYTO:${chatId}]\n\n` +
             `💬 মেসেজ:\n${text}`
         );
-        await msg.reply(
+        await sendMessage(chatId,
             `✅ আপনার মেসেজ অ্যাডমিনের কাছে পাঠানো হয়েছে।\n` +
             `রিপ্লাই পেলে এখানেই নোটিফিকেশন আসবে। ⏳`
         );
     } catch (e) {
-        await msg.reply('❌ মেসেজ পাঠাতে সমস্যা হয়েছে। সরাসরি যোগাযোগ করুন: 📞 01724-084350');
+        await sendMessage(chatId, '❌ মেসেজ পাঠাতে সমস্যা হয়েছে। সরাসরি যোগাযোগ করুন: 📞 01724-084350');
     }
 }
 
-async function handleDue(msg, chatId) {
-    const linked = await getDb(`sabuj/telegram_users/${chatId}`);
+async function handleDue(chatId) {
+    const key    = encodeKey(chatId);
+    const linked = await getDb(`sabuj/telegram_users/${key}`);
     if (!linked?.appId) {
-        await msg.reply(`❌ অ্যাকাউন্ট লিঙ্ক করা নেই।\n*!link* টাইপ করে অ্যাকাউন্ট লিঙ্ক করুন।`);
+        await sendMessage(chatId, `❌ অ্যাকাউন্ট লিঙ্ক করা নেই।\n*!link* টাইপ করে অ্যাকাউন্ট লিঙ্ক করুন।`);
         return;
     }
 
     const appData = await getDb(`sabuj/applications/${linked.appId}`);
-    if (!appData) { await msg.reply('❌ ডাটাবেস থেকে তথ্য পাওয়া যায়নি।'); return; }
+    if (!appData) { await sendMessage(chatId, '❌ ডাটাবেস থেকে তথ্য পাওয়া যায়নি।'); return; }
 
     const { total = 0, paid = 0, due = 0 } = appData.payment || {};
     const name = appData.personal?.nameBn || 'শিক্ষার্থী';
     const icon = parseInt(due) === 0 ? '✅' : '⚠️';
 
-    let text = (
+    await sendMessage(chatId,
         `💳 *ফি স্ট্যাটাস — ${name}*\n\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `📊 মোট ফি:     ৳${total}\n` +
@@ -565,25 +419,25 @@ async function handleDue(msg, chatId) {
         `${icon} বকেয়া ফি:  ৳${due}\n` +
         `━━━━━━━━━━━━━━━━━━`
     );
-    await msg.reply(text);
 
     if (parseInt(due) > 0) {
-        await msg.reply(
+        await sendMessage(chatId,
             `🔔 *রিমাইন্ডার:* দয়া করে বকেয়া ফি দ্রুত পরিশোধ করুন।\n` +
             `📞 যোগাযোগ: 01724-084350`
         );
     }
 }
 
-async function handleAttendance(msg, chatId) {
-    const linked = await getDb(`sabuj/telegram_users/${chatId}`);
+async function handleAttendance(chatId) {
+    const key    = encodeKey(chatId);
+    const linked = await getDb(`sabuj/telegram_users/${key}`);
     if (!linked?.appId) {
-        await msg.reply(`❌ অ্যাকাউন্ট লিঙ্ক করা নেই। *!link* দিয়ে লিঙ্ক করুন।`);
+        await sendMessage(chatId, `❌ অ্যাকাউন্ট লিঙ্ক করা নেই। *!link* দিয়ে লিঙ্ক করুন।`);
         return;
     }
 
     const stuData = await getDb(`sabuj/applications/${linked.appId}`);
-    if (!stuData) { await msg.reply('❌ ডাটাবেস থেকে তথ্য পাওয়া যায়নি।'); return; }
+    if (!stuData) { await sendMessage(chatId, '❌ ডাটাবেস থেকে তথ্য পাওয়া যায়নি।'); return; }
 
     const name       = stuData.personal?.nameBn || 'শিক্ষার্থী';
     const attendance = stuData.attendance;
@@ -610,24 +464,25 @@ async function handleAttendance(msg, chatId) {
             `বিস্তারিত: https://sabujcomputers.pro.bd/portal.html`
         );
     }
-    await msg.reply(text);
+    await sendMessage(chatId, text);
 }
 
-async function handleReceipt(msg, chatId) {
-    const linked = await getDb(`sabuj/telegram_users/${chatId}`);
+async function handleReceipt(chatId) {
+    const key    = encodeKey(chatId);
+    const linked = await getDb(`sabuj/telegram_users/${key}`);
     if (!linked?.appId) {
-        await msg.reply(`❌ অ্যাকাউন্ট লিঙ্ক করা নেই। *!link* দিয়ে লিঙ্ক করুন।`);
+        await sendMessage(chatId, `❌ অ্যাকাউন্ট লিঙ্ক করা নেই। *!link* দিয়ে লিঙ্ক করুন।`);
         return;
     }
 
     const appData = await getDb(`sabuj/applications/${linked.appId}`);
-    if (!appData) { await msg.reply('❌ ডাটাবেস থেকে তথ্য পাওয়া যায়নি।'); return; }
+    if (!appData) { await sendMessage(chatId, '❌ ডাটাবেস থেকে তথ্য পাওয়া যায়নি।'); return; }
 
     const { total = 0, paid = 0, due = 0 } = appData.payment || {};
     const name = appData.personal?.nameEn || 'Student';
     const reg  = appData.regNo || 'N/A';
 
-    const receipt = (
+    await sendMessage(chatId,
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
         `🧾 *DIGITAL RECEIPT*\n` +
         `   সবুজ কম্পিউটার ট্রেনিং সেন্টার\n` +
@@ -642,51 +497,55 @@ async function handleReceipt(msg, chatId) {
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
         `✅ System Generated | Official Receipt`
     );
-    await msg.reply(receipt);
 }
 
-async function handleUnlink(msg, chatId) {
-    const linked = await getDb(`sabuj/telegram_users/${chatId}`);
+async function handleUnlink(chatId) {
+    const key    = encodeKey(chatId);
+    const linked = await getDb(`sabuj/telegram_users/${key}`);
     if (linked) {
-        await deleteDb(`sabuj/telegram_users/${chatId}`);
-        await msg.reply(
+        await deleteDb(`sabuj/telegram_users/${key}`);
+        await sendMessage(chatId,
             `✅ আপনার অ্যাকাউন্ট সফলভাবে আনলিঙ্ক করা হয়েছে।\n` +
             `পুনরায় লিঙ্ক করতে *!link* টাইপ করুন।`
         );
     } else {
-        await msg.reply('⚠️ আপনার অ্যাকাউন্ট আগে থেকেই লিঙ্ক করা নেই।');
+        await sendMessage(chatId, '⚠️ আপনার অ্যাকাউন্ট আগে থেকেই লিঙ্ক করা নেই।');
     }
 }
 
 // ── Admin Commands ──
 
-async function handleBroadcast(msg, chatId, text) {
+async function handleBroadcast(chatId, text) {
     if (!isAdmin(chatId)) {
-        await msg.reply('❌ এই কমান্ডটি শুধু অ্যাডমিন ব্যবহার করতে পারবেন।');
+        await sendMessage(chatId, '❌ এই কমান্ডটি শুধু অ্যাডমিন ব্যবহার করতে পারবেন।');
         return;
     }
     const parts = text.split(' ').slice(1).join(' ');
-    if (!parts) { await msg.reply('সঠিক নিয়ম: `!broadcast আপনার মেসেজ`'); return; }
+    if (!parts) { await sendMessage(chatId, 'সঠিক নিয়ম: `!broadcast আপনার মেসেজ`'); return; }
 
     const users = await getDb('sabuj/telegram_users');
-    if (!users) { await msg.reply('কোনো লিঙ্কড ইউজার পাওয়া যায়নি।'); return; }
+    if (!users) { await sendMessage(chatId, 'কোনো লিঙ্কড ইউজার পাওয়া যায়নি।'); return; }
 
     let success = 0, failed = 0;
-    for (const uid of Object.keys(users)) {
+    for (const [, userData] of Object.entries(users)) {
+        const targetPhone = userData.phone;
+        if (!targetPhone) { failed++; continue; }
         try {
-            await client.sendMessage(uid, `📢 *সেন্টার থেকে বিজ্ঞপ্তি:*\n\n${parts}`);
+            await sendMessage(targetPhone, `📢 *সেন্টার থেকে বিজ্ঞপ্তি:*\n\n${parts}`);
             success++;
         } catch { failed++; }
     }
-    await msg.reply(`📊 *ব্রডকাস্ট রিপোর্ট:*\n\n✅ সফল: ${success} জন\n❌ ব্যর্থ: ${failed} জন`);
+    await sendMessage(chatId, `📊 *ব্রডকাস্ট রিপোর্ট:*\n\n✅ সফল: ${success} জন\n❌ ব্যর্থ: ${failed} জন`);
 }
 
-async function handleAddNotice(msg, chatId, text) {
-    if (!isAdmin(chatId)) { await msg.reply('❌ অ্যাডমিন পারমিশন নেই।'); return; }
+async function handleAddNotice(chatId, text) {
+    if (!isAdmin(chatId)) { await sendMessage(chatId, '❌ অ্যাডমিন পারমিশন নেই।'); return; }
 
     const parts = text.split(' ').slice(1).join(' ');
     if (!parts) {
-        await msg.reply('সঠিক নিয়ম:\n`!add_notice টাইটেল | বিবরণ`\n\nঅথবা:\n`!add_notice বিবরণ`');
+        await sendMessage(chatId,
+            'সঠিক নিয়ম:\n`!add_notice টাইটেল | বিবরণ`\n\nঅথবা:\n`!add_notice বিবরণ`'
+        );
         return;
     }
 
@@ -697,53 +556,55 @@ async function handleAddNotice(msg, chatId, text) {
 
     await putDb(`sabuj/notices/t${nowTs()}`, { title, details, date: dateStr });
 
-    // Notify all linked users
+    // সব linked user-কে notify করুন
     const users = await getDb('sabuj/telegram_users');
     let success = 0, failed = 0;
     if (users) {
-        for (const uid of Object.keys(users)) {
+        for (const [, userData] of Object.entries(users)) {
+            const targetPhone = userData.phone;
+            if (!targetPhone) { failed++; continue; }
             try {
-                await client.sendMessage(uid, `📌 *নতুন নোটিশ: ${title}*\n\n${details}\n\n🗓️ _${dateStr}_`);
+                await sendMessage(targetPhone, `📌 *নতুন নোটিশ: ${title}*\n\n${details}\n\n🗓️ _${dateStr}_`);
                 success++;
             } catch { failed++; }
         }
     }
-    await msg.reply(
+    await sendMessage(chatId,
         `✅ নোটিশ সংরক্ষিত এবং ${success} জনকে পাঠানো হয়েছে।` +
         (failed ? ` (${failed} জনের কাছে পৌঁছানো যায়নি।)` : '')
     );
 }
 
-async function handleDeleteNotice(msg, chatId, text) {
-    if (!isAdmin(chatId)) { await msg.reply('❌ অ্যাডমিন পারমিশন নেই।'); return; }
+async function handleDeleteNotice(chatId, text) {
+    if (!isAdmin(chatId)) { await sendMessage(chatId, '❌ অ্যাডমিন পারমিশন নেই।'); return; }
 
     const parts = text.split(' ');
     if (parts.length < 2) {
         const notices = await getDb('sabuj/notices');
-        if (!notices) { await msg.reply('কোনো নোটিশ নেই।'); return; }
+        if (!notices) { await sendMessage(chatId, 'কোনো নোটিশ নেই।'); return; }
         let list = `📋 *নোটিশ তালিকা (key সহ):*\n\n`;
         for (const [key, n] of Object.entries(notices).slice(0, 10)) {
             list += `🔑 \`${key}\` — ${n.title || ''}\n`;
         }
         list += `\n\`!delete_notice <key>\` দিয়ে মুছুন`;
-        await msg.reply(list);
+        await sendMessage(chatId, list);
         return;
     }
 
     const key = parts[1];
     const ok  = await deleteDb(`sabuj/notices/${key}`);
-    await msg.reply(ok
+    await sendMessage(chatId, ok
         ? `✅ নোটিশ \`${key}\` মুছে ফেলা হয়েছে।`
         : `❌ মুছতে সমস্যা হয়েছে। key টি সঠিক কিনা দেখুন।`
     );
 }
 
-async function handleVerifyStudent(msg, chatId, text) {
-    if (!isAdmin(chatId)) { await msg.reply('❌ অ্যাডমিন পারমিশন নেই।'); return; }
+async function handleVerifyStudent(chatId, text) {
+    if (!isAdmin(chatId)) { await sendMessage(chatId, '❌ অ্যাডমিন পারমিশন নেই।'); return; }
 
     const parts = text.split(' ');
     if (parts.length < 2) {
-        await msg.reply('সঠিক নিয়ম: `!verify_student <RegNo বা Phone>`');
+        await sendMessage(chatId, 'সঠিক নিয়ম: `!verify_student <RegNo বা Phone>`');
         return;
     }
 
@@ -760,7 +621,7 @@ async function handleVerifyStudent(msg, chatId, text) {
             const feeDue  = data.payment?.due  || 'N/A';
             const feePaid = data.payment?.paid || 'N/A';
 
-            await msg.reply(
+            await sendMessage(chatId,
                 `✅ *স্টুডেন্ট তথ্য পাওয়া গেছে*\n\n` +
                 `━━━━━━━━━━━━━━━━━━\n` +
                 `👤 নাম (বাংলা): ${name}\n` +
@@ -775,11 +636,11 @@ async function handleVerifyStudent(msg, chatId, text) {
             return;
         }
     }
-    await msg.reply('❌ কোনো স্টুডেন্ট ডাটা পাওয়া যায়নি।');
+    await sendMessage(chatId, '❌ কোনো স্টুডেন্ট ডাটা পাওয়া যায়নি।');
 }
 
-async function handleStats(msg, chatId) {
-    if (!isAdmin(chatId)) { await msg.reply('❌ অ্যাডমিন পারমিশন নেই।'); return; }
+async function handleStats(chatId) {
+    if (!isAdmin(chatId)) { await sendMessage(chatId, '❌ অ্যাডমিন পারমিশন নেই।'); return; }
 
     const apps    = (await getDb('sabuj/applications')) || {};
     const users   = (await getDb('sabuj/telegram_users')) || {};
@@ -797,7 +658,7 @@ async function handleStats(msg, chatId) {
         }
     }
 
-    await msg.reply(
+    await sendMessage(chatId,
         `📊 *বট পরিসংখ্যান*\n\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `👨‍🎓 মোট শিক্ষার্থী:  ${totalApps}\n` +
@@ -811,12 +672,11 @@ async function handleStats(msg, chatId) {
     );
 }
 
-async function handleAI(msg, chatId, text, state) {
+async function handleAI(chatId, text, state) {
     try {
         const botSettings  = (await getDb('sabuj/bot_settings')) || {};
         const systemPrompt = botSettings.system_prompt || DEFAULT_SYSTEM_PROMPT;
 
-        // Build conversation history (multi-turn)
         const history = state.chatHistory || [];
         history.push({ role: 'user', parts: [{ text }] });
 
@@ -824,33 +684,212 @@ async function handleAI(msg, chatId, text, state) {
             model: 'gemini-2.5-flash',
             config: {
                 systemInstruction: systemPrompt,
-                temperature: 0.35,
-                maxOutputTokens: 512,
+                temperature:       0.35,
+                maxOutputTokens:   512,
             },
-            history: history.slice(0, -1), // all except current message
+            history: history.slice(0, -1),
         });
 
         const response = await chat.sendMessage({ message: text });
         const reply    = response.text?.trim() || 'দুঃখিত, কোনো উত্তর পাওয়া যায়নি।';
 
-        // Save history
         history.push({ role: 'model', parts: [{ text: reply }] });
-        if (history.length > MAX_HISTORY_TURNS * 2) {
-            state.chatHistory = history.slice(-(MAX_HISTORY_TURNS * 2));
-        } else {
-            state.chatHistory = history;
-        }
+        state.chatHistory = history.length > MAX_HISTORY_TURNS * 2
+            ? history.slice(-(MAX_HISTORY_TURNS * 2))
+            : history;
 
-        await msg.reply(reply);
+        await sendMessage(chatId, reply);
     } catch (e) {
         console.error('Gemini error:', e.message);
-        await msg.reply(
-            '⚠️ দুঃখিত, AI সার্ভারে সমস্যা হচ্ছে। মেনু দেখতে *!menu* টাইপ করুন।'
-        );
+        await sendMessage(chatId, '⚠️ দুঃখিত, AI সার্ভারে সমস্যা হচ্ছে। মেনু দেখতে *!menu* টাইপ করুন।');
     }
 }
 
 // ──────────────────────────────────────────────
-// 🚀 Start Bot
+// 🔑 Firebase key encoding
+// (Firebase key-এ '+', ':', '@' ইত্যাদি চলে না)
+// chatId: "whatsapp:+8801724084350"
 // ──────────────────────────────────────────────
-client.initialize();
+function encodeKey(chatId) {
+    // "whatsapp:+8801724084350" → "wa_8801724084350"
+    return 'wa_' + chatId.replace('whatsapp:+', '').replace(/\D/g, '');
+}
+
+// ──────────────────────────────────────────────
+// 📨 Main Webhook Handler
+// ──────────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+    // Twilio এর request এর সাথে সাথে 200 পাঠান (timeout এড়াতে)
+    res.status(200).send('OK');
+
+    const chatId     = req.body.From   || '';   // e.g. "whatsapp:+8801XXXXXXXXX"
+    const text       = (req.body.Body  || '').trim();
+    const senderName = req.body.ProfileName || '';
+
+    if (!chatId || chatId === 'whatsapp:') return;
+
+    const state = getState(chatId);
+
+    // ── Rate limit (admin বাদে) ──
+    if (!isAdmin(chatId) && isRateLimited(chatId)) {
+        await sendMessage(chatId, '⏳ একটু থামুন! অনেক দ্রুত মেসেজ পাঠাচ্ছেন। কিছুক্ষণ পর আবার চেষ্টা করুন।');
+        return;
+    }
+
+    // ── Admin: user-কে reply forward করুন ──
+    // Admin লেখেন: "reply whatsapp:+880... আপনার রিপ্লাই মেসেজ"
+    // অথবা আগের মেসেজে [REPLYTO:...] ছিল — এখানে সহজ command-based পদ্ধতি:
+    if (isAdmin(chatId) && text.toLowerCase().startsWith('reply ')) {
+        const parts  = text.split(' ');
+        const target = parts[1]; // whatsapp:+880XXXXXXXXX
+        const reply  = parts.slice(2).join(' ');
+        if (target && reply) {
+            await sendMessage(target, `🎧 *অ্যাডমিনের রিপ্লাই:*\n\n${reply}`);
+            await sendMessage(chatId, `✅ রিপ্লাই পাঠানো হয়েছে → ${target}`);
+        } else {
+            await sendMessage(chatId, 'সঠিক নিয়ম: `reply whatsapp:+880XXXXXXXXX আপনার রিপ্লাই`');
+        }
+        return;
+    }
+
+    // ── State: Account Linking ──
+    if (state.awaiting === 'link_reg') {
+        await handleLinkAccount(chatId, text, state);
+        return;
+    }
+
+    // ── State: Talk to Admin ──
+    if (state.awaiting === 'talk_admin') {
+        await handleTalkAdmin(chatId, text, senderName, state);
+        return;
+    }
+
+    // ── Commands ──
+    const cmd = text.toLowerCase().split(' ')[0];
+
+    switch (cmd) {
+        case '!start':
+        case '!menu':
+            await sendMessage(chatId, mainMenuText());
+            break;
+
+        case '!help':
+            await sendMessage(chatId, helpText());
+            break;
+
+        case '!courses':
+            await handleCourses(chatId);
+            break;
+
+        case '!fees':
+            await sendMessage(chatId, feesText());
+            break;
+
+        case '!admission':
+            await sendMessage(chatId, admissionText());
+            break;
+
+        case '!results':
+            await sendMessage(chatId,
+                `🏆 *ফলাফল ও সার্টিফিকেট যাচাই*\n\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                `আপনার রেজিস্ট্রেশন নম্বর দিয়ে অনলাইনে যাচাই করুন:\n\n` +
+                `🔗 https://sabujcomputers.pro.bd/verify.html`
+            );
+            break;
+
+        case '!notice':
+            await handleNotice(chatId);
+            break;
+
+        case '!contact':
+            await sendMessage(chatId, contactText());
+            break;
+
+        case '!link':
+            state.awaiting = 'link_reg';
+            await sendMessage(chatId,
+                `🔗 *অ্যাকাউন্ট লিঙ্ক করুন*\n\n` +
+                `আপনার *ফোন নম্বর* অথবা *রেজিস্ট্রেশন নম্বর* টাইপ করে সেন্ড করুন:\n\n` +
+                `_(উদাহরণ: 01724084350 বা SC-2024-001)_`
+            );
+            break;
+
+        case '!due':
+            await handleDue(chatId);
+            break;
+
+        case '!attendance':
+            await handleAttendance(chatId);
+            break;
+
+        case '!receipt':
+            await handleReceipt(chatId);
+            break;
+
+        case '!unlink':
+            await handleUnlink(chatId);
+            break;
+
+        case '!admin':
+            state.awaiting = 'talk_admin';
+            await sendMessage(chatId,
+                `🎧 *সরাসরি অ্যাডমিনের সাথে কথা বলুন*\n\n` +
+                `আপনার প্রশ্ন বা মেসেজটি এখন টাইপ করে সেন্ড করুন।\n` +
+                `অ্যাডমিন কিছুক্ষণের মধ্যে রিপ্লাই দেবেন। ⏳`
+            );
+            break;
+
+        // ── Admin Commands ──
+        case '!broadcast':
+            await handleBroadcast(chatId, text);
+            break;
+
+        case '!add_notice':
+            await handleAddNotice(chatId, text);
+            break;
+
+        case '!delete_notice':
+            await handleDeleteNotice(chatId, text);
+            break;
+
+        case '!verify_student':
+            await handleVerifyStudent(chatId, text);
+            break;
+
+        case '!stats':
+            await handleStats(chatId);
+            break;
+
+        default:
+            // ── Gemini AI (free text) ──
+            if (!text.startsWith('!') && aiClient) {
+                await handleAI(chatId, text, state);
+            } else if (text.startsWith('!')) {
+                await sendMessage(chatId, `❓ কমান্ড বোঝা যায়নি। *!help* টাইপ করুন সব কমান্ড দেখতে।`);
+            } else {
+                await sendMessage(chatId, `আমি বুঝতে পারিনি। *!menu* টাইপ করুন মেনু দেখতে।`);
+            }
+    }
+});
+
+// Health check endpoint (Railway জন্য)
+app.get('/', (req, res) => {
+    res.send('✅ সবুজ কম্পিউটার্স WhatsApp Bot চলছে!');
+});
+
+// ──────────────────────────────────────────────
+// 🚀 Server Start
+// ──────────────────────────────────────────────
+app.listen(PORT, () => {
+    console.log(`✅ সবুজ কম্পিউটার্স WhatsApp Bot চালু!`);
+    console.log(`🌐 Server running on port ${PORT}`);
+    console.log(`📡 Webhook URL: https://your-app.railway.app/webhook`);
+    console.log(`\n📋 Environment Check:`);
+    console.log(`   Twilio SID:    ${TWILIO_ACCOUNT_SID ? '✅ Set' : '❌ Missing'}`);
+    console.log(`   Twilio Token:  ${TWILIO_AUTH_TOKEN  ? '✅ Set' : '❌ Missing'}`);
+    console.log(`   Twilio Number: ${TWILIO_WA_NUMBER   ? '✅ Set' : '❌ Missing'}`);
+    console.log(`   Gemini Key:    ${GEMINI_API_KEY     ? '✅ Set' : '❌ Missing'}`);
+    console.log(`   Admin Phone:   ${ADMIN_PHONE        ? '✅ Set' : '❌ Missing'}`);
+    console.log(`   Firebase URL:  ${FIREBASE_URL       ? '✅ Set' : '❌ Missing'}`);
+});
