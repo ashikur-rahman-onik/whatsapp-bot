@@ -1,0 +1,15 @@
+{
+  "name": "sabuj-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "সবুজ কম্পিউটার্স WhatsApp Bot",
+  "main": "whatsapp_bot.js",
+  "scripts": {
+    "start": "node whatsapp_bot.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.23.0",
+    "@google/genai": "^1.0.0",
+    "axios": "^1.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
