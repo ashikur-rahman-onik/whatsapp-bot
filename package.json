@@ -1,15 +1,18 @@
 {
   "name": "sabuj-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "সবুজ কম্পিউটার্স WhatsApp Bot",
+  "version": "2.0.0",
+  "description": "সবুজ কম্পিউটার্স WhatsApp Bot (Twilio Edition)",
   "main": "whatsapp_bot.js",
   "scripts": {
     "start": "node whatsapp_bot.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.23.0",
+    "twilio": "^5.3.0",
     "@google/genai": "^1.0.0",
     "axios": "^1.6.0",
-    "qrcode-terminal": "^0.12.0"
+    "express": "^4.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
